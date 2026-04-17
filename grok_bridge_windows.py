@@ -38,6 +38,7 @@ INPUT_SELECTORS = [
 ]
 SEND_SELECTORS = [
     'button[aria-label="Send"]',
+    'button[aria-label="Submit"]',
     'button[data-testid="send-button"]',
 ]
 BROWSER_CANDIDATES = (
