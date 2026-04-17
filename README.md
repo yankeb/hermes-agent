@@ -46,6 +46,37 @@ source ~/.bashrc    # reload shell (or: source ~/.zshrc)
 hermes              # start chatting!
 ```
 
+### Experimental: Grok bridge from WSL2 via Windows Chrome/Edge
+
+If you want to drive a logged-in [grok.com](https://grok.com) browser session without an official API key, this repo now includes an experimental bridge for WSL2:
+
+```bash
+python grok_bridge_windows.py --port 19998 --debug-port 9222
+```
+
+What it does:
+- launches Windows Chrome/Edge from WSL with a dedicated remote-debugging port
+- opens `grok.com` in that browser profile
+- exposes a tiny REST API compatible with the original bridge shape:
+  - `POST /chat`
+  - `POST /new`
+  - `GET /health`
+  - `GET /history`
+
+Example:
+
+```bash
+curl -X POST http://127.0.0.1:19998/chat \
+  -H "Content-Type: application/json" \
+  -d '{"prompt":"Explain speculative decoding simply.","timeout":90}'
+```
+
+Notes:
+- this is browser automation, not an official Grok API
+- the first run uses a dedicated browser profile; log into grok.com there once
+- on future runs you can reuse that profile or point `--profile-dir` somewhere else
+- if you already launched Chrome/Edge with `--remote-debugging-port=9222`, use `--connect-only`
+
 ---
 
 ## Getting Started
