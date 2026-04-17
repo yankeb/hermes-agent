@@ -45,6 +45,17 @@ def test_build_browser_command_sets_remote_debugging_and_profile():
     assert command[-1] == "https://grok.com"
 
 
+def test_build_browser_command_uses_existing_profile_when_none_provided():
+    command = gbw.build_browser_command(
+        browser_path="/mnt/c/Program Files/Google/Chrome/Application/chrome.exe",
+        debug_port=9222,
+        profile_dir=None,
+        startup_url="https://grok.com",
+    )
+
+    assert not any(arg.startswith("--user-data-dir=") for arg in command)
+
+
 def test_choose_grok_target_prefers_exact_grok_tab():
     targets = [
         {"id": "other", "type": "page", "url": "https://example.com"},
@@ -80,3 +91,25 @@ def test_build_send_prompt_expression_escapes_prompt_content():
     assert 'const prompt = ' in expression
     assert '"Say \'hi\'\\nnext line"'.replace("\\'", "'") in expression
     assert "button.click()" in expression
+
+
+def test_build_powershell_command_uses_encoded_command():
+    command = gbw.build_powershell_command("Write-Output 'hi'")
+
+    assert command[:2] == ["powershell.exe", "-NoProfile"]
+    assert "-ExecutionPolicy" in command
+    assert "Bypass" in command
+    assert command[-2] == "-EncodedCommand"
+    assert len(command[-1]) > 10
+
+
+def test_build_windows_cdp_eval_script_contains_websocket_and_payload():
+    script = gbw.build_windows_cdp_eval_script(
+        websocket_url="ws://127.0.0.1:9222/devtools/page/abc",
+        payload_json='{"id":1}',
+        timeout=15,
+    )
+
+    assert "ClientWebSocket" in script
+    assert "ws://127.0.0.1:9222/devtools/page/abc" in script
+    assert "FromBase64String" in script

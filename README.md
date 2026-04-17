@@ -56,7 +56,7 @@ python grok_bridge_windows.py --port 19998 --debug-port 9222
 
 What it does:
 - launches Windows Chrome/Edge from WSL with a dedicated remote-debugging port
-- opens `grok.com` in that browser profile
+- reuses your existing signed-in browser session by default
 - exposes a tiny REST API compatible with the original bridge shape:
   - `POST /chat`
   - `POST /new`
@@ -73,8 +73,7 @@ curl -X POST http://127.0.0.1:19998/chat \
 
 Notes:
 - this is browser automation, not an official Grok API
-- the first run uses a dedicated browser profile; log into grok.com there once
-- on future runs you can reuse that profile or point `--profile-dir` somewhere else
+- if you want an isolated browser profile instead of your normal Chrome session, pass `--profile-dir`
 - if you already launched Chrome/Edge with `--remote-debugging-port=9222`, use `--connect-only`
 
 ---

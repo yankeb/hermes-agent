@@ -1,38 +1,29 @@
 #!/usr/bin/env python3
 """WSL2/Windows Chromium bridge for Grok.
 
-This is a Windows/Chromium port of the macOS Safari-based grok-bridge concept.
-It runs from WSL/Linux, launches a Windows Chrome/Edge instance with a dedicated
-remote debugging port, drives grok.com through the Chrome DevTools Protocol,
-and exposes a small REST API for Hermes or any other local automation.
+Runs from WSL/Linux, controls a Windows Chrome/Edge instance through the Chrome
+DevTools Protocol using PowerShell as the Windows-side transport, and exposes a
+small REST API compatible with the original grok-bridge shape.
 """
 
 from __future__ import annotations
 
 import argparse
-import asyncio
+import base64
 import json
 import os
 import re
 import subprocess
-import threading
+import tempfile
 import time
-import urllib.error
-import urllib.parse
-import urllib.request
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from socketserver import ThreadingMixIn
 from typing import Any, Callable, Iterable, Sequence
 
-try:
-    import websockets
-except Exception:  # pragma: no cover - handled at runtime
-    websockets = None
-
 GROK_URL = "https://grok.com/"
-VERSION = "windows-v1"
+VERSION = "windows-v2"
 DEFAULT_DEBUG_PORT = 9222
 DEFAULT_PORT = 19998
 DEFAULT_POLL_INTERVAL = 2.0
@@ -107,20 +98,22 @@ def detect_windows_browser_path(
 def build_browser_command(
     browser_path: str,
     debug_port: int,
-    profile_dir: Path,
+    profile_dir: Path | None,
     startup_url: str = GROK_URL,
 ) -> list[str]:
-    return [
+    command = [
         browser_path,
         f"--remote-debugging-port={debug_port}",
-        f"--user-data-dir={profile_dir}",
         "--no-first-run",
         "--no-default-browser-check",
         "--disable-background-networking",
         "--disable-component-update",
         "--disable-features=Translate,OptimizationHints",
-        startup_url,
     ]
+    if profile_dir is not None:
+        command.append(f"--user-data-dir={profile_dir}")
+    command.append(startup_url)
+    return command
 
 
 def choose_grok_target(targets: Iterable[dict[str, Any]]) -> dict[str, Any] | None:
@@ -128,11 +121,12 @@ def choose_grok_target(targets: Iterable[dict[str, Any]]) -> dict[str, Any] | No
     if not page_targets:
         return None
 
-    def score(target: dict[str, Any]) -> tuple[int, int]:
+    def score(target: dict[str, Any]) -> tuple[int, int, int]:
         url = str(target.get("url") or "")
         exact = 0 if url.startswith("https://grok.com") or url.startswith("http://grok.com") else 1
         chat = 0 if "grok.com" in url and ("/chat" in url or url.rstrip("/") == "https://grok.com") else 1
-        return (exact, chat)
+        empty = 0 if url else 1
+        return (exact, chat, empty)
 
     return sorted(page_targets, key=score)[0]
 
@@ -251,12 +245,128 @@ def _wsl_to_windows_path(path: Path) -> str:
         return raw
 
 
+def _ps_quote(text: str) -> str:
+    return text.replace("'", "''")
+
+
+def build_powershell_command(script: str) -> list[str]:
+    encoded = base64.b64encode(script.encode("utf-16le")).decode("ascii")
+    return [
+        "powershell.exe",
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-EncodedCommand",
+        encoded,
+    ]
+
+
+def run_powershell(script: str) -> str:
+    temp_dir = Path("/mnt/c/Windows/Temp")
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".ps1", dir=temp_dir, delete=False) as handle:
+        handle.write(script)
+        temp_path = Path(handle.name)
+    windows_temp_path = _wsl_to_windows_path(temp_path)
+    try:
+        result = subprocess.run(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                windows_temp_path,
+            ],
+            capture_output=True,
+            text=True,
+        )
+    finally:
+        try:
+            temp_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip() or f"PowerShell exited with {result.returncode}"
+        raise BridgeError(detail)
+    return result.stdout.strip()
+
+
+def run_powershell_json(script: str) -> Any:
+    raw = run_powershell(script)
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise BridgeError(f"Expected JSON from PowerShell, got: {raw[:500]}") from exc
+
+
+def build_windows_http_script(url: str, method: str = "GET", timeout: int = 5) -> str:
+    return f"""
+$ProgressPreference = 'SilentlyContinue'
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$uri = '{_ps_quote(url)}'
+$method = '{_ps_quote(method)}'
+try {{
+    $resp = Invoke-WebRequest -UseBasicParsing -Uri $uri -Method $method -TimeoutSec {int(timeout)}
+    Write-Output $resp.Content
+}} catch {{
+    Write-Error $_.Exception.Message
+    exit 1
+}}
+""".strip()
+
+
+def build_windows_cdp_eval_script(websocket_url: str, payload_json: str, timeout: int = 20) -> str:
+    payload_b64 = base64.b64encode(payload_json.encode("utf-8")).decode("ascii")
+    return f"""
+$ProgressPreference = 'SilentlyContinue'
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+Add-Type -AssemblyName System.Net.Http
+$uri = [Uri]::new('{_ps_quote(websocket_url)}')
+$payload = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('{payload_b64}'))
+$timeoutMs = {int(timeout * 1000)}
+$cts = [System.Threading.CancellationTokenSource]::new()
+$cts.CancelAfter($timeoutMs)
+$ws = [System.Net.WebSockets.ClientWebSocket]::new()
+try {{
+    [void]$ws.ConnectAsync($uri, $cts.Token).GetAwaiter().GetResult()
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($payload)
+    $segment = [System.ArraySegment[byte]]::new($bytes)
+    [void]$ws.SendAsync($segment, [System.Net.WebSockets.WebSocketMessageType]::Text, $true, $cts.Token).GetAwaiter().GetResult()
+    while ($true) {{
+        $buffer = New-Object byte[] 65536
+        $builder = [System.Text.StringBuilder]::new()
+        do {{
+            $recv = $ws.ReceiveAsync([System.ArraySegment[byte]]::new($buffer), $cts.Token).GetAwaiter().GetResult()
+            if ($recv.MessageType -eq [System.Net.WebSockets.WebSocketMessageType]::Close) {{ break }}
+            [void]$builder.Append([System.Text.Encoding]::UTF8.GetString($buffer, 0, $recv.Count))
+        }} while (-not $recv.EndOfMessage)
+        if ($builder.Length -eq 0) {{ continue }}
+        $text = $builder.ToString()
+        if (-not $text) {{ continue }}
+        if ($text -match '"id"\s*:\s*1') {{
+            Write-Output $text
+            break
+        }}
+    }}
+}} catch {{
+    Write-Error $_.Exception.Message
+    exit 1
+}} finally {{
+    try {{
+        if ($ws.State -eq [System.Net.WebSockets.WebSocketState]::Open) {{
+            [void]$ws.CloseAsync([System.Net.WebSockets.WebSocketCloseStatus]::NormalClosure, 'done', [System.Threading.CancellationToken]::None).GetAwaiter().GetResult()
+        }}
+    }} catch {{}}
+    $ws.Dispose()
+    $cts.Dispose()
+}}
+""".strip()
+
+
 class CDPBridge:
     def __init__(self, config: BridgeConfig):
         self.config = config
-        self._lock = threading.Lock()
-        profile_dir = config.profile_dir or (Path.home() / ".cache" / "hermes-grok-bridge")
-        self.profile_dir = profile_dir
         self.browser_path = config.browser_path or detect_windows_browser_path()
 
     def health(self) -> dict[str, Any]:
@@ -282,56 +392,53 @@ class CDPBridge:
             }
 
     def history(self) -> dict[str, Any]:
-        with self._lock:
-            target = self._ensure_grok_target()
-            body = self._get_body(target.websocket_url)
-            return {
-                "status": "ok",
-                "content": clean_response_text(body),
-                "raw_length": len(body),
-            }
+        target = self._ensure_grok_target()
+        body = self._get_body(target.websocket_url)
+        return {
+            "status": "ok",
+            "content": clean_response_text(body),
+            "raw_length": len(body),
+        }
 
     def new_conversation(self) -> dict[str, Any]:
-        with self._lock:
-            target = self._ensure_grok_target()
-            self._eval(target.websocket_url, _build_navigate_expression(self.config.startup_url))
-            self._wait_for_input(target.websocket_url, timeout=30)
-            return {"status": "ok", "url": self.config.startup_url}
+        target = self._ensure_grok_target()
+        self._eval(target.websocket_url, _build_navigate_expression(self.config.startup_url))
+        self._wait_for_input(target.websocket_url, timeout=30)
+        return {"status": "ok", "url": self.config.startup_url}
 
     def chat(self, prompt: str, timeout: int = DEFAULT_BROWSER_TIMEOUT) -> dict[str, Any]:
-        with self._lock:
-            target = self._ensure_grok_target()
-            self._wait_for_input(target.websocket_url, timeout=min(timeout, 30))
-            body_before = self._get_body(target.websocket_url)
-            send_result = self._eval(target.websocket_url, build_send_prompt_expression(prompt))
-            if not send_result.get("ok"):
-                return {"status": "error", "error": send_result.get("error", "send failed")}
+        target = self._ensure_grok_target()
+        self._wait_for_input(target.websocket_url, timeout=min(timeout, 30))
+        body_before = self._get_body(target.websocket_url)
+        send_result = self._eval(target.websocket_url, build_send_prompt_expression(prompt))
+        if not send_result.get("ok"):
+            return {"status": "error", "error": send_result.get("error", "send failed")}
 
-            started = time.time()
-            stable = 0
-            last_body = body_before
-            while time.time() - started < timeout:
-                time.sleep(self.config.poll_interval)
-                body = self._get_body(target.websocket_url)
-                if body != body_before and body == last_body:
-                    stable += 1
-                    if stable >= self.config.stable_polls:
-                        return {
-                            "status": "ok",
-                            "response": extract_response_from_body(body, prompt),
-                            "elapsed": round(time.time() - started, 1),
-                            "meta": send_result,
-                        }
-                else:
-                    stable = 0
-                last_body = body
+        started = time.time()
+        stable = 0
+        last_body = body_before
+        while time.time() - started < timeout:
+            time.sleep(self.config.poll_interval)
+            body = self._get_body(target.websocket_url)
+            if body != body_before and body == last_body:
+                stable += 1
+                if stable >= self.config.stable_polls:
+                    return {
+                        "status": "ok",
+                        "response": extract_response_from_body(body, prompt),
+                        "elapsed": round(time.time() - started, 1),
+                        "meta": send_result,
+                    }
+            else:
+                stable = 0
+            last_body = body
 
-            return {
-                "status": "timeout",
-                "response": extract_response_from_body(last_body, prompt),
-                "elapsed": round(time.time() - started, 1),
-                "meta": send_result,
-            }
+        return {
+            "status": "timeout",
+            "response": extract_response_from_body(last_body, prompt),
+            "elapsed": round(time.time() - started, 1),
+            "meta": send_result,
+        }
 
     def _ensure_debug_endpoint(self) -> None:
         try:
@@ -347,11 +454,15 @@ class CDPBridge:
         if not self.browser_path:
             raise BridgeError("No Windows Chrome/Edge executable found under /mnt/c/Program Files")
 
-        self.profile_dir.mkdir(parents=True, exist_ok=True)
+        profile_dir = (
+            Path(_wsl_to_windows_path(self.config.profile_dir))
+            if self.config.profile_dir is not None
+            else None
+        )
         command = build_browser_command(
             browser_path=self.browser_path,
             debug_port=self.config.debug_port,
-            profile_dir=Path(_wsl_to_windows_path(self.profile_dir)),
+            profile_dir=profile_dir,
             startup_url=self.config.startup_url,
         )
         subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -410,23 +521,21 @@ class CDPBridge:
 
     def _json_get(self, path: str) -> Any:
         url = f"http://127.0.0.1:{self.config.debug_port}{path}"
-        try:
-            with urllib.request.urlopen(url, timeout=5) as response:
-                return json.loads(response.read().decode("utf-8"))
-        except urllib.error.URLError as exc:
-            raise BridgeError(f"Failed to reach {url}: {exc}") from exc
+        script = build_windows_http_script(url=url, method="GET", timeout=5)
+        return run_powershell_json(script)
 
     def _open_new_tab(self, url: str) -> Any:
-        encoded_url = urllib.parse.quote(url, safe="")
-        request = urllib.request.Request(
-            f"http://127.0.0.1:{self.config.debug_port}/json/new?{encoded_url}",
+        encoded_url = urllib_parse_quote(url)
+        script = build_windows_http_script(
+            url=f"http://127.0.0.1:{self.config.debug_port}/json/new?{encoded_url}",
             method="PUT",
+            timeout=5,
         )
-        with urllib.request.urlopen(request, timeout=5) as response:
-            return json.loads(response.read().decode("utf-8"))
+        return run_powershell_json(script)
 
     def _eval(self, websocket_url: str, expression: str) -> Any:
-        payload = {
+        request = {
+            "id": 1,
             "method": "Runtime.evaluate",
             "params": {
                 "expression": expression,
@@ -434,24 +543,18 @@ class CDPBridge:
                 "awaitPromise": True,
             },
         }
-        result = asyncio.run(self._send_cdp(websocket_url, payload))
+        script = build_windows_cdp_eval_script(
+            websocket_url=websocket_url,
+            payload_json=json.dumps(request),
+            timeout=self.config.connect_timeout,
+        )
+        message = run_powershell_json(script)
+        if "error" in message:
+            raise BridgeError(f"CDP error: {message['error']}")
+        result = message.get("result", {})
         if "exceptionDetails" in result:
             raise BridgeError(f"JavaScript evaluation failed: {result['exceptionDetails']}")
         return result.get("result", {}).get("value")
-
-    async def _send_cdp(self, websocket_url: str, payload: dict[str, Any]) -> dict[str, Any]:
-        if websockets is None:
-            raise BridgeError("Missing Python dependency: websockets")
-        request = dict(payload)
-        request["id"] = 1
-        async with websockets.connect(websocket_url, open_timeout=self.config.connect_timeout) as ws:
-            await ws.send(json.dumps(request))
-            while True:
-                message = json.loads(await ws.recv())
-                if message.get("id") == request["id"]:
-                    if "error" in message:
-                        raise BridgeError(f"CDP error: {message['error']}")
-                    return message["result"]
 
 
 class _BridgeHandler(BaseHTTPRequestHandler):
@@ -510,6 +613,12 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
     daemon_threads = True
 
 
+def urllib_parse_quote(url: str) -> str:
+    from urllib.parse import quote
+
+    return quote(url, safe="")
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="WSL2/Windows Chrome Grok bridge")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="HTTP server port")
@@ -517,7 +626,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--browser-path", help="Windows Chrome/Edge executable path")
     parser.add_argument(
         "--profile-dir",
-        help="Dedicated browser profile directory (default: ~/.cache/hermes-grok-bridge)",
+        help="Optional dedicated browser profile directory. Omit to reuse your existing signed-in browser session.",
     )
     parser.add_argument("--startup-url", default=GROK_URL, help="Initial URL to open in the browser")
     parser.add_argument("--browser-timeout", type=int, default=DEFAULT_BROWSER_TIMEOUT)
