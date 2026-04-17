@@ -95,6 +95,8 @@ class TestResolveCommand:
         assert resolve_command("background").name == "background"
         assert resolve_command("copy").name == "copy"
         assert resolve_command("agents").name == "agents"
+        assert resolve_command("grok").name == "grok"
+        assert resolve_command("compare").name == "compare"
 
     def test_alias_resolves_to_canonical(self):
         assert resolve_command("bg").name == "background"
@@ -140,6 +142,8 @@ class TestDerivedDicts:
         assert "/exit" in COMMANDS
         assert "/reload_mcp" in COMMANDS
         assert "/gateway" in COMMANDS
+        assert "/grok" in COMMANDS
+        assert "/compare" in COMMANDS
 
     def test_commands_by_category_covers_all_categories(self):
         registry_categories = {cmd.category for cmd in COMMAND_REGISTRY if not cmd.gateway_only}

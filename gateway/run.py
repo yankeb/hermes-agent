@@ -3415,6 +3415,19 @@ class GatewayRunner:
             except Exception as e:
                 logger.exception("Failed to prepare /plan command")
                 return f"Failed to enter plan mode: {e}"
+
+        if canonical in {"grok", "compare"}:
+            try:
+                from grok_bridge_client import build_grok_command_message
+
+                user_instruction = event.get_command_args().strip()
+                if not user_instruction:
+                    return "Usage: /grok <prompt>" if canonical == "grok" else "Usage: /compare <prompt>"
+                event.text = build_grok_command_message(canonical, user_instruction)
+                canonical = None
+            except Exception as e:
+                logger.exception("Failed to prepare /%s command", canonical)
+                return f"Failed to prepare /{canonical}: {e}"
         
         if canonical == "retry":
             return await self._handle_retry_command(event)

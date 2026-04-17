@@ -5675,6 +5675,8 @@ class HermesCLI:
             self._handle_personality_command(cmd_original)
         elif canonical == "plan":
             self._handle_plan_command(cmd_original)
+        elif canonical in {"grok", "compare"}:
+            self._handle_grok_workflow_command(canonical, cmd_original)
         elif canonical == "retry":
             retry_msg = self.retry_last()
             if retry_msg and hasattr(self, '_pending_input'):
@@ -5934,6 +5936,25 @@ class HermesCLI:
             self._pending_input.put(msg)
         else:
             ChatConsole().print("[bold red]Plan mode unavailable: input queue not initialized[/]")
+
+    def _handle_grok_workflow_command(self, canonical: str, cmd: str):
+        """Queue /grok or /compare as an agent prompt that uses the Grok bridge tools."""
+        from grok_bridge_client import build_grok_command_message
+
+        parts = cmd.strip().split(maxsplit=1)
+        if len(parts) < 2 or not parts[1].strip():
+            usage = "/grok <prompt>" if canonical == "grok" else "/compare <prompt>"
+            _cprint(f"  Usage: {usage}")
+            return
+
+        user_instruction = parts[1].strip()
+        msg = build_grok_command_message(canonical, user_instruction)
+        if hasattr(self, '_pending_input'):
+            label = "Grok" if canonical == "grok" else "Compare"
+            _cprint(f"  🧠 {label} workflow queued via Grok bridge tools.")
+            self._pending_input.put(msg)
+        else:
+            ChatConsole().print("[bold red]Grok workflow unavailable: input queue not initialized[/]")
     
     def _handle_background_command(self, cmd: str):
         """Handle /background <prompt> — run a prompt in a separate background session.

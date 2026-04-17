@@ -46,6 +46,8 @@ _HERMES_CORE_TOOLS = [
     "browser_vision", "browser_console", "browser_cdp",
     # Text-to-speech
     "text_to_speech",
+    # Grok browser bridge
+    "grok_chat", "grok_health", "grok_new_conversation", "grok_history",
     # Planning & memory
     "todo", "memory",
     # Session history search
@@ -153,6 +155,12 @@ TOOLSETS = {
     "tts": {
         "description": "Text-to-speech: convert text to audio with Edge TTS (free), ElevenLabs, OpenAI, or xAI",
         "tools": ["text_to_speech"],
+        "includes": []
+    },
+
+    "grok": {
+        "description": "Local Grok browser bridge tools for querying a logged-in Grok session",
+        "tools": ["grok_chat", "grok_health", "grok_new_conversation", "grok_history"],
         "includes": []
     },
     

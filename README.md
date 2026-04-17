@@ -71,6 +71,39 @@ curl -X POST http://127.0.0.1:19998/chat \
   -d '{"prompt":"Explain speculative decoding simply.","timeout":90}'
 ```
 
+Workflow integration:
+- native tools are auto-registered when the bridge is reachable:
+  - `grok_chat`
+  - `grok_health`
+  - `grok_new_conversation`
+  - `grok_history`
+- slash commands route through those tools:
+  - `/grok <prompt>`
+  - `/compare <prompt>`
+- configure a non-default bridge URL with either:
+
+```bash
+export GROK_BRIDGE_URL=http://127.0.0.1:20001
+```
+
+or in `~/.hermes/config.yaml`:
+
+```yaml
+grok_bridge:
+  url: http://127.0.0.1:20001
+```
+
+Optional MCP wrapper:
+
+```yaml
+mcp_servers:
+  grok_bridge:
+    command: python
+    args: [/absolute/path/to/grok_bridge_mcp.py]
+    env:
+      GROK_BRIDGE_URL: http://127.0.0.1:20001
+```
+
 Notes:
 - this is browser automation, not an official Grok API
 - if you want an isolated browser profile instead of your normal Chrome session, pass `--profile-dir`
@@ -107,6 +140,7 @@ Hermes has two entry points: start the terminal UI with `hermes`, or run the gat
 | Retry or undo the last turn | `/retry`, `/undo` | `/retry`, `/undo` |
 | Compress context / check usage | `/compress`, `/usage`, `/insights [--days N]` | `/compress`, `/usage`, `/insights [days]` |
 | Browse skills | `/skills` or `/<skill-name>` | `/skills` or `/<skill-name>` |
+| Ask Grok / compare Grok vs current model | `/grok <prompt>`, `/compare <prompt>` | `/grok <prompt>`, `/compare <prompt>` |
 | Interrupt current work | `Ctrl+C` or send a new message | `/stop` or send a new message |
 | Platform-specific status | `/platforms` | `/status`, `/sethome` |
 

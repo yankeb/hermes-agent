@@ -145,6 +145,10 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("browser", "Connect browser tools to your live Chrome via CDP", "Tools & Skills",
                cli_only=True, args_hint="[connect|disconnect|status]",
                subcommands=("connect", "disconnect", "status")),
+    CommandDef("grok", "Send a prompt through the Grok bridge workflow", "Tools & Skills",
+               args_hint="<prompt>"),
+    CommandDef("compare", "Compare the current model against Grok for the same prompt", "Tools & Skills",
+               args_hint="<prompt>"),
     CommandDef("plugins", "List installed plugins and their status",
                "Tools & Skills", cli_only=True),
 
