@@ -4597,6 +4597,44 @@ class HermesCLI:
         except Exception:
             pass
 
+    def _count_tool_calls_since(self, start_index: int) -> int:
+        """Count tool activity in conversation_history after a given message index."""
+        count = 0
+        for msg in self.conversation_history[max(0, start_index):]:
+            if msg.get("role") == "tool":
+                count += 1
+            tool_calls = msg.get("tool_calls") or []
+            if isinstance(tool_calls, list):
+                count += len(tool_calls)
+        return count
+
+    def _maybe_self_improve_after_complex_turn(self, start_index: int, result: Optional[dict]) -> None:
+        """Persist learnings after complex turns, inspired by UserPromptSubmit hooks.
+
+        If a turn used many tools, give the agent one quiet flush pass to save
+        durable memories or create/patch skills. This turns long, successful
+        workflows into reusable procedural knowledge without waiting for a
+        manual /new, compression, or process exit.
+        """
+        if not self.agent or not self.conversation_history or not result:
+            return
+        if result.get("failed") or result.get("interrupted"):
+            return
+        try:
+            threshold = int(
+                self.config.get("agent", {}).get("self_improvement_min_tool_calls", 8)
+            )
+        except (TypeError, ValueError):
+            threshold = 8
+        if threshold <= 0:
+            return
+        if self._count_tool_calls_since(start_index) < threshold:
+            return
+        try:
+            self.agent.flush_memories(self.conversation_history, min_turns=0)
+        except (Exception, KeyboardInterrupt):
+            pass
+
     def new_session(self, silent=False):
         """Start a fresh session with a new session ID and cleared agent state."""
         if self.agent and self.conversation_history:
@@ -8363,6 +8401,7 @@ class HermesCLI:
             from run_agent import _sanitize_surrogates
             message = _sanitize_surrogates(message)
 
+        turn_start_history_len = len(self.conversation_history)
         # Add user message to history
         self.conversation_history.append({"role": "user", "content": message})
 
@@ -8644,6 +8683,8 @@ class HermesCLI:
                     )
                 except Exception:
                     pass
+
+            self._maybe_self_improve_after_complex_turn(turn_start_history_len, result)
 
             # Handle failed or partial results (e.g., non-retryable errors, rate limits,
             # truncated output, invalid tool calls). Both "failed" and "partial" with

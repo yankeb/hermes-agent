@@ -7337,7 +7337,9 @@ class AIAgent:
         """
         if self._memory_flush_min_turns == 0 and min_turns is None:
             return
-        if "memory" not in self.valid_tool_names or not self._memory_store:
+        memory_available = "memory" in self.valid_tool_names and bool(self._memory_store)
+        skills_available = "skill_manage" in self.valid_tool_names
+        if not memory_available and not skills_available:
             return
         effective_min = min_turns if min_turns is not None else self._memory_flush_min_turns
         if self._user_turn_count < effective_min:
@@ -7349,9 +7351,12 @@ class AIAgent:
             return
 
         flush_content = (
-            "[System: The session is being compressed. "
-            "Save anything worth remembering — prioritize user preferences, "
-            "corrections, and recurring patterns over task-specific details.]"
+            "[System: The session is being finalized or compressed. Review the "
+            "conversation and preserve only durable value. Save important user "
+            "preferences, corrections, environment facts, and recurring patterns "
+            "to memory. If a non-trivial workflow was discovered, fixed, or "
+            "improved, create or patch a skill so future sessions can reuse it. "
+            "Skip one-off task details and do nothing if nothing is worth saving.]"
         )
         _sentinel = f"__flush_{id(self)}_{time.monotonic()}"
         flush_msg = {"role": "user", "content": flush_content, "_flush_sentinel": _sentinel}
@@ -7375,14 +7380,22 @@ class AIAgent:
             if self._cached_system_prompt:
                 api_messages = [{"role": "system", "content": self._cached_system_prompt}] + api_messages
 
-            # Make one API call with only the memory tool available
+            # Make one API call with only self-improvement tools available.
+            # Memory captures declarative facts; skill_manage captures reusable
+            # procedures/workflows discovered during the session.
             memory_tool_def = None
+            skill_manage_tool_def = None
             for t in (self.tools or []):
-                if t.get("function", {}).get("name") == "memory":
+                tool_name = t.get("function", {}).get("name")
+                if tool_name == "memory" and memory_available:
                     memory_tool_def = t
-                    break
+                elif tool_name == "skill_manage" and skills_available:
+                    skill_manage_tool_def = t
 
-            if not memory_tool_def:
+            flush_tool_defs = [
+                t for t in (memory_tool_def, skill_manage_tool_def) if t is not None
+            ]
+            if not flush_tool_defs:
                 messages.pop()  # remove flush msg
                 return
 
@@ -7409,7 +7422,7 @@ class AIAgent:
                 response = _call_llm(
                     task="flush_memories",
                     messages=api_messages,
-                    tools=[memory_tool_def],
+                    tools=flush_tool_defs,
                     temperature=_flush_temperature,
                     max_tokens=5120,
                     # timeout resolved from auxiliary.flush_memories.timeout config
@@ -7421,7 +7434,7 @@ class AIAgent:
             if not _aux_available and self.api_mode == "codex_responses":
                 # No auxiliary client -- use the Codex Responses path directly
                 codex_kwargs = self._build_api_kwargs(api_messages)
-                codex_kwargs["tools"] = self._get_transport().convert_tools([memory_tool_def])
+                codex_kwargs["tools"] = self._get_transport().convert_tools(flush_tool_defs)
                 if _flush_temperature is not None:
                     codex_kwargs["temperature"] = _flush_temperature
                 else:
@@ -7434,7 +7447,7 @@ class AIAgent:
                 _tflush = self._get_transport()
                 ant_kwargs = _tflush.build_kwargs(
                     model=self.model, messages=api_messages,
-                    tools=[memory_tool_def], max_tokens=5120,
+                    tools=flush_tool_defs, max_tokens=5120,
                     reasoning_config=None,
                     preserve_dots=self._anthropic_preserve_dots(),
                 )
@@ -7475,20 +7488,21 @@ class AIAgent:
                             function=SimpleNamespace(name=tc.name, arguments=tc.arguments),
                         ) for tc in _flush_result.tool_calls
                     ]
+            elif _aux_available and hasattr(response, "choices") and response.choices:
+                # Auxiliary client returns an OpenAI-shaped response regardless
+                # of the main transport mode; extract tool_calls directly.
+                _aux_msg = response.choices[0].message
+                if hasattr(_aux_msg, "tool_calls") and _aux_msg.tool_calls:
+                    tool_calls = _aux_msg.tool_calls
             elif self.api_mode in ("chat_completions", "bedrock_converse"):
                 # chat_completions / bedrock — normalize through transport
                 _flush_result = self._get_transport().normalize_response(response)
                 if _flush_result.tool_calls:
                     tool_calls = _flush_result.tool_calls
-            elif _aux_available and hasattr(response, "choices") and response.choices:
-                # Auxiliary client returned OpenAI-shaped response while main
-                # api_mode is codex/anthropic — extract tool_calls from .choices
-                _aux_msg = response.choices[0].message
-                if hasattr(_aux_msg, "tool_calls") and _aux_msg.tool_calls:
-                    tool_calls = _aux_msg.tool_calls
 
             for tc in tool_calls:
-                if tc.function.name == "memory":
+                tool_name = getattr(tc.function, "name", "")
+                if tool_name == "memory" and memory_available:
                     try:
                         args = json.loads(tc.function.arguments)
                         flush_target = args.get("target", "memory")
@@ -7504,6 +7518,25 @@ class AIAgent:
                             print(f"  🧠 Memory flush: saved to {args.get('target', 'memory')}")
                     except Exception as e:
                         logger.debug("Memory flush tool call failed: %s", e)
+                elif tool_name == "skill_manage" and skills_available:
+                    try:
+                        args = json.loads(tc.function.arguments)
+                        from tools.skill_manager_tool import skill_manage as _skill_manage
+                        _skill_manage(
+                            action=args.get("action"),
+                            name=args.get("name"),
+                            content=args.get("content"),
+                            category=args.get("category"),
+                            file_path=args.get("file_path"),
+                            file_content=args.get("file_content"),
+                            old_string=args.get("old_string"),
+                            new_string=args.get("new_string"),
+                            replace_all=bool(args.get("replace_all", False)),
+                        )
+                        if not self.quiet_mode:
+                            print(f"  🧠 Skill flush: updated {args.get('name', 'skill')}")
+                    except Exception as e:
+                        logger.debug("Skill flush tool call failed: %s", e)
         except Exception as e:
             logger.debug("Memory flush API call failed: %s", e)
         finally:

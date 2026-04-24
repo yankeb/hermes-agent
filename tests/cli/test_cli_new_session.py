@@ -188,6 +188,32 @@ def test_clear_command_starts_new_session_before_redrawing(tmp_path):
     assert cli.conversation_history == []
 
 
+def test_complex_turn_triggers_self_improvement_flush(tmp_path):
+    cli = _prepare_cli_with_active_session(tmp_path)
+    cli.conversation_history = [{"role": "user", "content": "before"}]
+    start_index = len(cli.conversation_history)
+    cli.conversation_history.extend(
+        [{"role": "assistant", "tool_calls": [{"id": f"call_{i}"}]} for i in range(8)]
+    )
+
+    cli._maybe_self_improve_after_complex_turn(start_index, {"completed": True})
+
+    cli.agent.flush_memories.assert_called_once_with(cli.conversation_history, min_turns=0)
+
+
+def test_simple_turn_skips_self_improvement_flush(tmp_path):
+    cli = _prepare_cli_with_active_session(tmp_path)
+    cli.conversation_history = [{"role": "user", "content": "before"}]
+    start_index = len(cli.conversation_history)
+    cli.conversation_history.extend(
+        [{"role": "assistant", "tool_calls": [{"id": f"call_{i}"}]} for i in range(7)]
+    )
+
+    cli._maybe_self_improve_after_complex_turn(start_index, {"completed": True})
+
+    cli.agent.flush_memories.assert_not_called()
+
+
 def test_new_session_resets_token_counters(tmp_path):
     """Regression test for #2099: /new must zero all token counters."""
     cli = _prepare_cli_with_active_session(tmp_path)

@@ -91,6 +91,29 @@ def _chat_response_with_memory_call():
     )
 
 
+def _chat_response_with_skill_call():
+    """Simulated chat completions response with a skill_manage tool call."""
+    return SimpleNamespace(
+        choices=[SimpleNamespace(
+            message=SimpleNamespace(
+                content=None,
+                tool_calls=[SimpleNamespace(
+                    function=SimpleNamespace(
+                        name="skill_manage",
+                        arguments=json.dumps({
+                            "action": "create",
+                            "name": "debugging-widget-tests",
+                            "content": "---\nname: debugging-widget-tests\ndescription: Debug widget tests\n---\n\n# Debug widget tests\n",
+                            "category": "software-development",
+                        }),
+                    ),
+                )],
+            ),
+        )],
+        usage=SimpleNamespace(prompt_tokens=100, completion_tokens=20, total_tokens=120),
+    )
+
+
 class TestFlushMemoriesRespectsConfigTimeout:
     """flush_memories() must NOT hardcode timeout=30.0 — it should defer
     to the config value via auxiliary.flush_memories.timeout."""
@@ -205,6 +228,36 @@ class TestFlushMemoriesUsesAuxiliaryClient:
         assert call_kwargs.kwargs["action"] == "add"
         assert call_kwargs.kwargs["target"] == "notes"
         assert "dark mode" in call_kwargs.kwargs["content"]
+
+    def test_flush_exposes_and_executes_skill_manage_tool_calls(self, monkeypatch):
+        """Self-improvement flush should be able to create/patch skills, not just memories."""
+        agent = _make_agent(monkeypatch, api_mode="chat_completions", provider="openrouter")
+        skill_tool = {
+            "type": "function",
+            "function": {
+                "name": "skill_manage",
+                "description": "Manage skills.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+        agent.tools.append(skill_tool)
+        agent.valid_tool_names.add("skill_manage")
+
+        mock_response = _chat_response_with_skill_call()
+        with patch("agent.auxiliary_client.call_llm", return_value=mock_response) as mock_call:
+            messages = [
+                {"role": "user", "content": "We debugged this flaky widget test"},
+                {"role": "assistant", "content": "The reusable fix is documented."},
+                {"role": "user", "content": "thanks"},
+            ]
+            with patch("tools.skill_manager_tool.skill_manage", return_value='{"success": true}') as mock_skill:
+                agent.flush_memories(messages)
+
+        tool_names = [tool["function"]["name"] for tool in mock_call.call_args.kwargs["tools"]]
+        assert tool_names == ["memory", "skill_manage"]
+        mock_skill.assert_called_once()
+        assert mock_skill.call_args.kwargs["action"] == "create"
+        assert mock_skill.call_args.kwargs["name"] == "debugging-widget-tests"
 
     def test_flush_strips_artifacts_from_messages(self, monkeypatch):
         """After flush, the flush prompt and any response should be removed from messages."""
